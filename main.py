@@ -53,51 +53,107 @@ class UniversityData(BaseModel):
     admission_deadlines: List[AdmissionDeadline] = []
     page_metadata: List[PageMetadata] = []
 
+# ... (Keep your Pydantic schemas and imports exactly the same at the top) ...
 
 # ==========================================
-# 2. DYNAMIC CRAWLER (Base Logic)
+# 2. DYNAMIC CRAWLER (Max Depth 2 BFS)
 # ==========================================
 
 class UniversityCrawler:
     def __init__(self, start_url: str):
-        # Ensure the URL is properly formatted
         if not start_url.startswith(('http://', 'https://')):
             start_url = 'https://' + start_url
         self.start_url = start_url
         self.base_domain = urlparse(start_url).netloc
+        self.visited: Set[str] = set()
+        
+        # Heuristics designed to hit the target URLs
+        self.target_keywords = ['admission', 'apply', 'tuition', 'cost', 'fee', 'financial-aid', 'attendance']
+        
+    def _is_internal(self, url: str) -> bool:
+        netloc = urlparse(url).netloc
+        return netloc == '' or self.base_domain in netloc
 
-    def fetch_and_clean(self, url: str) -> str:
-        """Fetches a single page and cleans the HTML of scripts/styles."""
-        try:
-            # We use a custom User-Agent so we don't get blocked by basic bot-protection
-            response = requests.get(url, timeout=10, headers={'User-Agent': 'Data-ETL-Bot'})
+    def _score_relevance(self, url: str, text: str) -> int:
+        """Scores a URL based on the presence of keywords in the URL or anchor text."""
+        url_lower, text_lower = url.lower(), text.lower()
+        score = 0
+        for kw in self.target_keywords:
+            if kw in url_lower:
+                score += 3  # High weight for keywords in URL path
+            if kw in text_lower:
+                score += 1  # Lower weight for text-based matches
+        return score
+
+    def discover_pages(self, max_depth: int = 2) -> List[Dict[str, Any]]:
+        queue = [(self.start_url, 0)]
+        self.visited.add(self.start_url)
+        relevant_pages = []
+        scrape_time = datetime.now().isoformat()
+
+        print(f"[*] Commencing Breadth-First Search (Max Depth: {max_depth}) from {self.start_url}...")
+
+        while queue:
+            current_url, depth = queue.pop(0)
             
-            if response.status_code != 200:
-                return f"Error: Status code {response.status_code}"
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # CRITICAL: Strip out scripts, styles, and navigation to save LLM tokens later
-            for script in soup(["script", "style", "nav", "footer"]):
-                script.extract()
-            
-            # Get clean text
-            clean_text = soup.get_text(separator=' ', strip=True)
-            return clean_text
-            
-        except requests.RequestException as e:
-            return f"Request failed: {e}"
+            try:
+                response = requests.get(current_url, timeout=10, headers={'User-Agent': 'Data-ETL-Bot'})
+                status_code = str(response.status_code)
+                
+                if response.status_code != 200:
+                    continue
+                
+                soup = BeautifulSoup(response.text, 'html.parser')
+                title = soup.title.string.strip() if soup.title else ""
+                
+                relevance_score = self._score_relevance(current_url, title)
+                
+                # If it's a relevant page, extract and clean the text
+                if depth > 0 and relevance_score > 0:
+                    for script in soup(["script", "style", "nav", "footer"]):
+                        script.extract()
+                    clean_text = soup.get_text(separator=' ', strip=True)
+                    
+                    relevant_pages.append({
+                        'url': current_url,
+                        'title': title,
+                        'content': clean_text[:12000], # Chunking to save LLM context
+                        'score': relevance_score,
+                        'status_code': status_code,
+                        'scraped_at': scrape_time
+                    })
+
+                # Extract links for the next depth
+                if depth < max_depth:
+                    for a_tag in soup.find_all('a', href=True):
+                        href = a_tag['href']
+                        next_url = urljoin(current_url, href).split('#')[0] # Remove fragment identifiers
+                        
+                        if self._is_internal(next_url) and next_url not in self.visited:
+                            link_text = a_tag.get_text(strip=True)
+                            link_score = self._score_relevance(next_url, link_text)
+                            
+                            # Prune tree: only explore relevant links to save time and memory
+                            if depth == 0 or link_score > 0:
+                                self.visited.add(next_url)
+                                queue.append((next_url, depth + 1))
+                                
+            except requests.RequestException:
+                continue
+
+        # Sort by relevance and return the top 5
+        relevant_pages.sort(key=lambda x: x['score'], reverse=True)
+        return relevant_pages[:5]
 
 if __name__ == "__main__":
-    print("[*] Phase 3: Testing Base Crawler Initialization...")
-    
-    # Test our base crawler on Bucknell's homepage
+    print("[*] Phase 4: Testing Dynamic Discovery Algorithm...\n")
     crawler = UniversityCrawler("bucknell.edu")
-    print(f"[*] Base Domain identified as: {crawler.base_domain}")
-    print(f"[*] Fetching content from: {crawler.start_url} ...")
     
-    text_content = crawler.fetch_and_clean(crawler.start_url)
+    # Run the discovery
+    top_pages = crawler.discover_pages(max_depth=2)
     
-    print("\n[*] Success! Here is a snippet of the cleaned text (First 300 chars):")
+    print("\n[*] Discovery Complete. Top Pages Found:")
     print("-" * 50)
-    print(text_content[:300] + "...\n")
+    for idx, page in enumerate(top_pages):
+        print(f"{idx + 1}. Score: {page['score']} | URL: {page['url']}")
+        print(f"   Title: {page['title']}\n")
