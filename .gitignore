@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# Environments
+venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+
+# Environment Variables (CRITICAL)
+.env
