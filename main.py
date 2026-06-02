@@ -1,19 +1,27 @@
 import os
+import logging
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 from bs4 import BeautifulSoup
 from typing import List, Optional, Set, Dict, Any
 from enum import Enum
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, ValidationError
 from google import genai
 from google.genai import types
 
-# Load API key directly from environment for simplicity in this script
-# (Ensure you run `export GEMINI_API_KEY="your_key"` in your terminal before running)
+#structured logging config..
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+)
+logger = logging.getLogger("UniversityETLPipeline")
+
 API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# pydantic schema
+#pydantic schema configuration
 
 class Location(BaseModel):
     city: Optional[str] = None
@@ -57,10 +65,7 @@ class UniversityData(BaseModel):
     admission_deadlines: List[AdmissionDeadline] = []
     page_metadata: List[PageMetadata] = []
 
-
-# ==========================================
-# 2. DYNAMIC CRAWLER (Max Depth 2)
-# ==========================================
+#dynamic crawler logic
 
 class UniversityCrawler:
     def __init__(self, start_url: str):
@@ -71,6 +76,17 @@ class UniversityCrawler:
         self.visited: Set[str] = set()
         self.target_keywords = ['admission', 'apply', 'tuition', 'cost', 'fee', 'financial-aid', 'attendance']
         
+        # Robust Session Setup with Auto-Retry & Backoff Strategy
+        self.session = requests.Session()
+        retries = Retry(
+            total=3,                # Total number of retries
+            backoff_factor=1,       # Wait 1s, 2s, 4s between retries
+            status_forcelist=[500, 502, 503, 504], # Status codes to retry
+            raise_on_status=False
+        )
+        self.session.mount('http://', HTTPAdapter(max_retries=retries))
+        self.session.mount('https://', HTTPAdapter(max_retries=retries))
+
     def _is_internal(self, url: str) -> bool:
         netloc = urlparse(url).netloc
         return netloc == '' or self.base_domain in netloc
@@ -91,16 +107,21 @@ class UniversityCrawler:
         relevant_pages = []
         scrape_time = datetime.now().isoformat()
 
-        print(f"[*] Crawling {self.base_domain} (Max Depth: {max_depth})...")
+        logger.info(f"Starting BFS crawl for domain: {self.base_domain} (Max Depth: {max_depth})")
 
         while queue:
             current_url, depth = queue.pop(0)
             
             try:
-                response = requests.get(current_url, timeout=10, headers={'User-Agent': 'Data-ETL-Bot'})
+                response = self.session.get(
+                    current_url, 
+                    timeout=10, 
+                    headers={'User-Agent': 'Data-ETL-Bot/2.0'}
+                )
                 status_code = str(response.status_code)
                 
                 if response.status_code != 200:
+                    logger.warning(f"Failed to fetch {current_url} - Status Code: {status_code}")
                     continue
                 
                 soup = BeautifulSoup(response.text, 'html.parser')
@@ -135,12 +156,15 @@ class UniversityCrawler:
                                 self.visited.add(next_url)
                                 queue.append((next_url, depth + 1))
                                 
-            except requests.RequestException:
+            except requests.RequestException as e:
+                logger.error(f"Network error crawling {current_url}: {e}")
                 continue
 
         relevant_pages.sort(key=lambda x: x['score'], reverse=True)
         return relevant_pages[:5]
-# llm extractor
+
+
+#llm extraction pipeline
 
 def extract_structured_data(domain: str, pages_data: List[Dict[str, Any]]) -> UniversityData:
     if not API_KEY:
@@ -148,7 +172,6 @@ def extract_structured_data(domain: str, pages_data: List[Dict[str, Any]]) -> Un
         
     client = genai.Client(api_key=API_KEY)
     
-    # 1. Build the context string
     context = f"Domain: {domain}\n\n"
     for page in pages_data:
         context += f"--- URL: {page['url']} ---\n"
@@ -156,10 +179,8 @@ def extract_structured_data(domain: str, pages_data: List[Dict[str, Any]]) -> Un
         context += f"Scraped At: {page['scraped_at']} | Status: {page['status_code']}\n"
         context += f"Content: {page['content']}\n\n"
         
-    # 2. Extract the exact JSON schema from our Pydantic model
     schema_definition = UniversityData.model_json_schema()
         
-    # 3. Inject the schema directly into the prompt to bypass the SDK bug
     prompt = f"""
     You are an AI data extraction system. Analyze the following website contents scraped from {domain}.
     Extract the required information and strictly output a JSON object matching this exact JSON schema:
@@ -176,7 +197,7 @@ def extract_structured_data(domain: str, pages_data: List[Dict[str, Any]]) -> Un
     {context}
     """
     
-    # 4. Call the model using only the JSON mime type
+    logger.info(f"Dispatching payload to Gemini 2.5 Flash for domain: {domain}")
     response = client.models.generate_content(
         model='gemini-2.5-flash',
         contents=prompt,
@@ -186,28 +207,68 @@ def extract_structured_data(domain: str, pages_data: List[Dict[str, Any]]) -> Un
         ),
     )
     
-    # 5. Strictly validate the returned string against our Pydantic classes
     return UniversityData.model_validate_json(response.text)
-if __name__ == "__main__":
-    print("[*] Phase 5: Testing End-to-End Extraction Pipeline...\n")
-    
-    test_domain = "udc.edu"
-    crawler = UniversityCrawler(test_domain)
-    
-    top_pages = crawler.discover_pages(max_depth=2)
-    
-    if top_pages:
-        print(f"[*] Found {len(top_pages)} relevant pages. Passing to Gemini 2.5 Flash...")
+
+
+#Data quality auditor and runner
+
+def run_pipeline_for_domains(domains: List[str]):
+    summary_report = {}
+
+    for domain in domains:
+        logger.info(f"=== Starting Execution for {domain} ===")
+        start_time = datetime.now()
+        
         try:
-            # Extract the data
-            structured_data = extract_structured_data(test_domain, top_pages)
+            crawler = UniversityCrawler(domain)
+            top_pages = crawler.discover_pages(max_depth=2)
             
-            # Print the final validated JSON
-            print("\n[*] Extraction Complete! Final JSON Output:")
-            print("-" * 50)
+            if not top_pages:
+                logger.warning(f"No relevant landing pages discovered for {domain}. Skipping extraction.")
+                summary_report[domain] = {"status": "FAILED", "reason": "No pages discovered"}
+                continue
+                
+            structured_data = extract_structured_data(domain, top_pages)
+            
+            # --- Data Quality Checks ---
+            missing_fields = []
+            if not structured_data.overview or not structured_data.overview.university_name:
+                missing_fields.append("overview.university_name")
+            if not structured_data.tuition_breakdown:
+                missing_fields.append("tuition_breakdown")
+                
+            execution_time = (datetime.now() - start_time).total_seconds()
+            
+            summary_report[domain] = {
+                "status": "SUCCESS",
+                "execution_time_seconds": execution_time,
+                "pages_scraped_count": len(top_pages),
+                "records_extracted_tuition": len(structured_data.tuition_breakdown),
+                "records_extracted_deadlines": len(structured_data.admission_deadlines),
+                "data_quality_warnings": missing_fields if missing_fields else "None"
+            }
+            
+            logger.info(f"Successfully processed {domain} in {execution_time:.2s}s")
             print(structured_data.model_dump_json(indent=2))
             
+        except ValidationError as ve:
+            logger.error(f"Pydantic Validation failed for {domain}: {ve}")
+            summary_report[domain] = {"status": "FAILED", "reason": f"Pydantic Schema Failure: {ve}"}
         except Exception as e:
-            print(f"\n[!] Extraction failed: {e}")
-    else:
-        print("[!] No relevant pages found to extract.")
+            logger.error(f"Unexpected operational pipeline failure for {domain}: {e}")
+            summary_report[domain] = {"status": "FAILED", "reason": str(e)}
+
+    # Print Global Execution Summary Table
+    print("\n" + "="*60)
+    print("GLOBAL BATCH EXECUTION SUMMARY")
+    print("="*60)
+    for dom, details in summary_report.items():
+        print(f"Domain: {dom}")
+        for k, v in details.items():
+            print(f"  - {k}: {v}")
+        print("-" * 40)
+
+if __name__ == "__main__":
+    # Task Bonus Support for processing multiple university domains in a single run
+    target_universities = ["udc.edu", "bucknell.edu"]
+    run_pipeline_for_domains(target_universities)
