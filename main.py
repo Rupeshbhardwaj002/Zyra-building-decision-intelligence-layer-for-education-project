@@ -6,10 +6,14 @@ from bs4 import BeautifulSoup
 from typing import List, Optional, Set, Dict, Any
 from enum import Enum
 from pydantic import BaseModel, EmailStr
+from google import genai
+from google.genai import types
 
-# ==========================================
-# 1. PYDANTIC SCHEMA DEFINITION
-# ==========================================
+# Load API key directly from environment for simplicity in this script
+# (Ensure you run `export GEMINI_API_KEY="your_key"` in your terminal before running)
+API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# pydantic schema
 
 class Location(BaseModel):
     city: Optional[str] = None
@@ -53,10 +57,9 @@ class UniversityData(BaseModel):
     admission_deadlines: List[AdmissionDeadline] = []
     page_metadata: List[PageMetadata] = []
 
-# ... (Keep your Pydantic schemas and imports exactly the same at the top) ...
 
 # ==========================================
-# 2. DYNAMIC CRAWLER (Max Depth 2 BFS)
+# 2. DYNAMIC CRAWLER (Max Depth 2)
 # ==========================================
 
 class UniversityCrawler:
@@ -66,8 +69,6 @@ class UniversityCrawler:
         self.start_url = start_url
         self.base_domain = urlparse(start_url).netloc
         self.visited: Set[str] = set()
-        
-        # Heuristics designed to hit the target URLs
         self.target_keywords = ['admission', 'apply', 'tuition', 'cost', 'fee', 'financial-aid', 'attendance']
         
     def _is_internal(self, url: str) -> bool:
@@ -75,14 +76,13 @@ class UniversityCrawler:
         return netloc == '' or self.base_domain in netloc
 
     def _score_relevance(self, url: str, text: str) -> int:
-        """Scores a URL based on the presence of keywords in the URL or anchor text."""
         url_lower, text_lower = url.lower(), text.lower()
         score = 0
         for kw in self.target_keywords:
             if kw in url_lower:
-                score += 3  # High weight for keywords in URL path
+                score += 3 
             if kw in text_lower:
-                score += 1  # Lower weight for text-based matches
+                score += 1 
         return score
 
     def discover_pages(self, max_depth: int = 2) -> List[Dict[str, Any]]:
@@ -91,7 +91,7 @@ class UniversityCrawler:
         relevant_pages = []
         scrape_time = datetime.now().isoformat()
 
-        print(f"[*] Commencing Breadth-First Search (Max Depth: {max_depth}) from {self.start_url}...")
+        print(f"[*] Crawling {self.base_domain} (Max Depth: {max_depth})...")
 
         while queue:
             current_url, depth = queue.pop(0)
@@ -108,7 +108,6 @@ class UniversityCrawler:
                 
                 relevance_score = self._score_relevance(current_url, title)
                 
-                # If it's a relevant page, extract and clean the text
                 if depth > 0 and relevance_score > 0:
                     for script in soup(["script", "style", "nav", "footer"]):
                         script.extract()
@@ -117,23 +116,21 @@ class UniversityCrawler:
                     relevant_pages.append({
                         'url': current_url,
                         'title': title,
-                        'content': clean_text[:12000], # Chunking to save LLM context
+                        'content': clean_text[:12000],
                         'score': relevance_score,
                         'status_code': status_code,
                         'scraped_at': scrape_time
                     })
 
-                # Extract links for the next depth
                 if depth < max_depth:
                     for a_tag in soup.find_all('a', href=True):
                         href = a_tag['href']
-                        next_url = urljoin(current_url, href).split('#')[0] # Remove fragment identifiers
+                        next_url = urljoin(current_url, href).split('#')[0] 
                         
                         if self._is_internal(next_url) and next_url not in self.visited:
                             link_text = a_tag.get_text(strip=True)
                             link_score = self._score_relevance(next_url, link_text)
                             
-                            # Prune tree: only explore relevant links to save time and memory
                             if depth == 0 or link_score > 0:
                                 self.visited.add(next_url)
                                 queue.append((next_url, depth + 1))
@@ -141,19 +138,76 @@ class UniversityCrawler:
             except requests.RequestException:
                 continue
 
-        # Sort by relevance and return the top 5
         relevant_pages.sort(key=lambda x: x['score'], reverse=True)
         return relevant_pages[:5]
+# llm extractor
 
-if __name__ == "__main__":
-    print("[*] Phase 4: Testing Dynamic Discovery Algorithm...\n")
-    crawler = UniversityCrawler("bucknell.edu")
+def extract_structured_data(domain: str, pages_data: List[Dict[str, Any]]) -> UniversityData:
+    if not API_KEY:
+        raise ValueError("GEMINI_API_KEY environment variable is not set.")
+        
+    client = genai.Client(api_key=API_KEY)
     
-    # Run the discovery
+    # 1. Build the context string
+    context = f"Domain: {domain}\n\n"
+    for page in pages_data:
+        context += f"--- URL: {page['url']} ---\n"
+        context += f"Title: {page['title']}\n"
+        context += f"Scraped At: {page['scraped_at']} | Status: {page['status_code']}\n"
+        context += f"Content: {page['content']}\n\n"
+        
+    # 2. Extract the exact JSON schema from our Pydantic model
+    schema_definition = UniversityData.model_json_schema()
+        
+    # 3. Inject the schema directly into the prompt to bypass the SDK bug
+    prompt = f"""
+    You are an AI data extraction system. Analyze the following website contents scraped from {domain}.
+    Extract the required information and strictly output a JSON object matching this exact JSON schema:
+    
+    {schema_definition}
+    
+    Rules:
+    1. For the `tuition_breakdown`, create individual items for each fee (e.g., In-State Tuition, Room & Board) and convert costs to integers.
+    2. For `admission_deadlines`, map the deadline type strictly to the Enums ("Early Decision", "Regular Decision", "Transfer Admission"). Use `notes` for any context.
+    3. Populate `page_metadata` using the URL, Title, Scraped At, and Status Code provided in the context headers above.
+    4. Return null for fields you cannot confidently populate. Do not hallucinate data.
+    
+    Web Data Context:
+    {context}
+    """
+    
+    # 4. Call the model using only the JSON mime type
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.0 
+        ),
+    )
+    
+    # 5. Strictly validate the returned string against our Pydantic classes
+    return UniversityData.model_validate_json(response.text)
+if __name__ == "__main__":
+    print("[*] Phase 5: Testing End-to-End Extraction Pipeline...\n")
+    
+    test_domain = "udc.edu"
+    crawler = UniversityCrawler(test_domain)
+    
     top_pages = crawler.discover_pages(max_depth=2)
     
-    print("\n[*] Discovery Complete. Top Pages Found:")
-    print("-" * 50)
-    for idx, page in enumerate(top_pages):
-        print(f"{idx + 1}. Score: {page['score']} | URL: {page['url']}")
-        print(f"   Title: {page['title']}\n")
+    if top_pages:
+        print(f"[*] Found {len(top_pages)} relevant pages. Passing to Gemini 2.5 Flash...")
+        try:
+            # Extract the data
+            structured_data = extract_structured_data(test_domain, top_pages)
+            
+            # Print the final validated JSON
+            print("\n[*] Extraction Complete! Final JSON Output:")
+            print("-" * 50)
+            print(structured_data.model_dump_json(indent=2))
+            
+        except Exception as e:
+            print(f"\n[!] Extraction failed: {e}")
+    else:
+        print("[!] No relevant pages found to extract.")
