@@ -7,7 +7,9 @@ from typing import List, Optional, Set, Dict, Any
 from enum import Enum
 from pydantic import BaseModel, EmailStr
 
-#pydantic def ..
+# ==========================================
+# 1. PYDANTIC SCHEMA DEFINITION
+# ==========================================
 
 class Location(BaseModel):
     city: Optional[str] = None
@@ -52,7 +54,10 @@ class UniversityData(BaseModel):
     page_metadata: List[PageMetadata] = []
 
 
-#crawler dynamic
+# ==========================================
+# 2. DYNAMIC CRAWLER (Base Logic)
+# ==========================================
+
 class UniversityCrawler:
     def __init__(self, start_url: str):
         # Ensure the URL is properly formatted
@@ -86,7 +91,7 @@ class UniversityCrawler:
 if __name__ == "__main__":
     print("[*] Phase 3: Testing Base Crawler Initialization...")
     
-    # test of base crwaler on bucknell page
+    # Test our base crawler on Bucknell's homepage
     crawler = UniversityCrawler("bucknell.edu")
     print(f"[*] Base Domain identified as: {crawler.base_domain}")
     print(f"[*] Fetching content from: {crawler.start_url} ...")
